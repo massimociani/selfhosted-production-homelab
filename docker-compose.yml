@@ -1,0 +1,1189 @@
+services:
+
+  # ==========================================================================================
+  # 1. TRAEFIK (Edge Reverse Proxy, SSL Manager & CrowdSec L7 Security for All Hosted Sites)
+  # ==========================================================================================
+  traefik:
+    image: traefik:v3
+    container_name: traefik
+    environment:
+      # IMPORTANT: Cloudflare API token must cover all managed zones (${DOMAIN_1}, ${DOMAIN_NK1}, ${DOMAIN_2})
+      # Check provider documentation if using an alternate DNS registrar
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+      # --- Timezone configuration ---
+      - TZ=${TZ}
+    labels:
+      - "traefik.enable=true"
+    command:
+      - "--log.level=INFO"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # --- Security fix: Header anti-spoofing for Authelia ForwardAuth ---
+      - "--entrypoints.web.http.aliasHeadersStrategy=reject"
+      - "--entrypoints.websecure.http.aliasHeadersStrategy=reject"
+      - "--entrypoints.traefik.http.aliasHeadersStrategy=reject"
+      # --- HTTP/3 (QUIC) support ---
+      - "--entrypoints.websecure.http3"
+      - "--entrypoints.websecure.forwardedHeaders.trustedIPs=${CF_TRUSTED_IPS}"
+      # --- Dynamic file provider (enables Traefik CrowdSec bouncer plugin and custom configs) ---
+      - "--providers.file.filename=/etc/traefik/dynamic_conf.yml"
+      - "--providers.file.watch=true" # Automatically reloads dynamic configuration changes without restarting
+      # --- Global HTTP -> HTTPS redirection ---
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.websecure.http.tls.certResolver=cloudflare"
+      # --- Traefik Web Dashboard (disabled by default) ---
+      #- "--api.insecure=true"
+      #- "--api.dashboard=true"
+      # --- Let's Encrypt configuration (DNS-01 Challenge for Wildcard certificates) ---
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge=true"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.cloudflare.acme.email=${EMAIL}"
+      - "--certificatesresolvers.cloudflare.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.propagation.delayBeforeChecks=90"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.propagation.disableChecks=true"
+      # --- Certificate domain definitions ---
+      # 1. ${DOMAIN_1}
+      - "--entrypoints.websecure.http.tls.domains[0].main=${DOMAIN_1}"
+      - "--entrypoints.websecure.http.tls.domains[0].sans=*.${DOMAIN_1}"
+      # 2. ${DOMAIN_NK1} (Main + Subdomain)
+      - "--entrypoints.websecure.http.tls.domains[1].main=${DOMAIN_NK1}"
+      - "--entrypoints.websecure.http.tls.domains[1].sans=*.${DOMAIN_NK1}"
+      - "--entrypoints.websecure.http.tls.domains[2].sans=*.${MW_SUBNAME_NK1a}.${DOMAIN_NK1}"
+      # 3. ${DOMAIN_2} (Nextcloud and subdomains)
+      - "--entrypoints.websecure.http.tls.domains[3].main=${DOMAIN_2}"
+      - "--entrypoints.websecure.http.tls.domains[3].sans=*.${DOMAIN_2}"
+      # 4. ${DOMAIN_3}
+      - "--entrypoints.websecure.http.tls.domains[4].main=${DOMAIN_3}"
+      - "--entrypoints.websecure.http.tls.domains[4].sans=*.${DOMAIN_3}"
+      # --- Enable access log (shared with CrowdSec LAPI for real-time parsing) ---
+      - "--accesslog=true"
+      - "--accesslog.filepath=/var/log/traefik/access.log"
+      # --- CrowdSec bouncer Traefik plugin ---
+      - "--experimental.plugins.crowdsec.modulename=github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin"
+      - "--experimental.plugins.crowdsec.version=v1.8.1"
+      # --- Prometheus metrics export for monitoring ---
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.addEntryPointsLabels=true"
+      - "--metrics.prometheus.addRoutersLabels=true"
+      - "--metrics.prometheus.addServicesLabels=true"
+    ports:
+      - "80:80"
+      - "443:443/tcp"
+      - "443:443/udp"   # Required for HTTP/3 (QUIC)
+      #- "8080:8080"  # Enable only if exposing the Traefik dashboard
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      # --- Persistent storage for Let's Encrypt certificates ---
+      - "./traefik/acme.json:/letsencrypt/acme.json"
+      # --- Sync timezone with host ---
+      - /etc/localtime:/etc/localtime:ro
+      # --- Mount shared access log directory for CrowdSec parsing ---
+      - ./traefik/logs:/var/log/traefik
+      # --- Mount dynamic configuration for CrowdSec middleware ---
+      - ./traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}2
+      sdr_net:
+        ipv4_address: ${NET_SDR_NET}2
+    restart: always
+    depends_on:
+      crowdsec:
+        condition: service_healthy
+
+  # ==========================================
+  # 2. SECURITY (CrowdSec Threat Intelligence Engine)
+  # ==========================================
+  crowdsec:
+    image: crowdsecurity/crowdsec
+    container_name: crowdsec
+    environment:
+      - TZ=${TZ}
+      - GID=1000
+      - COLLECTIONS=crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx LePresidente/grafana crowdsecurity/traefik crowdsecurity/http-cve crowdsecurity/wordpress crowdsecurity/nextcloud crowdsecurity/apache2 crowdsecurity/whitelist-good-actors LePresidente/authelia
+      - DISABLE_SCENARIOS=crowdsecurity/http-crawl-non_statics
+      # Metrics export for Prometheus / VictoriaMetrics
+      - PROMETHEUS_ENABLED=true
+      - PROMETHEUS_LISTEN_PORT=6060
+    volumes:
+      - ./crowdsec/db:/var/lib/crowdsec/data
+      - ./crowdsec/config:/etc/crowdsec
+      # --- Host SSH auth logs ---
+      - /var/log/auth.log:/var/log/auth.log:ro
+      # --- Traefik access logs for L7 threat detection ---
+      - ./traefik/logs/access.log:/var/log/traefik/access.log:ro
+      # --- Sync timezone with host ---
+      - /etc/localtime:/etc/localtime:ro
+      # --- Docker socket access to parse logs from isolated containers (e.g., dmz_rsync via acquis.yaml) ---
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # --- Mount Nextcloud log for dedicated CrowdSec collection parsing ---
+      - ${BACKUP_02}/nc_data/nextcloud.log:/var/log/nextcloud.log:ro
+    ports:
+      - "127.0.0.1:8081:8080"  # Expose LAPI locally on port 8081 for the host firewall bouncer
+    healthcheck:
+      test:
+        - CMD
+        - cscli
+        - lapi
+        - status
+      interval: 10s
+      timeout: 5s
+      retries: 2
+      start_period: 30s
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}3
+
+    restart: always
+
+  # ==========================================
+  # 2a. AUTHENTICATION (Authelia SSO & 2FA)
+  # ==========================================
+  authelia:
+    image: authelia/authelia:latest
+    #profiles: ["disable"] # Uncomment to disable service
+    container_name: authelia
+    volumes:
+      - ./appdata/authelia:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=${TZ}
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}4
+    restart: always
+    depends_on:
+      - db
+      - redis
+    labels:
+      - "traefik.enable=true"
+      # Authelia portal login router
+      - "traefik.http.routers.authelia.rule=Host(`auth.${DOMAIN_2}`) || Host(`auth.${DOMAIN_1}`) || Host(`auth.${DOMAIN_NK1}`)"
+      - "traefik.http.routers.authelia.entrypoints=websecure"
+      - "traefik.http.routers.authelia.tls.certresolver=cloudflare"
+      - "traefik.http.services.authelia.loadbalancer.server.port=9091"
+      # --- MIDDLEWARE 1: Administrative portals (${DOMAIN_2}) ---
+      # Redirect unauthorized requests to auth.${DOMAIN_2}
+      - "traefik.http.middlewares.authelia-${MW_NAME_2}.forwardauth.address=http://authelia:9091/api/verify?rd=https://auth.${DOMAIN_2}/"
+      - "traefik.http.middlewares.authelia-${MW_NAME_2}.forwardauth.trustForwardHeader=true"
+      - "traefik.http.middlewares.authelia-${MW_NAME_2}.forwardauth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
+      - "traefik.http.middlewares.authelia-${MW_NAME_2}.forwardauth.maxResponseBodySize=10240"
+      - "traefik.http.routers.authelia-${MW_NAME_2}.middlewares=crowdsec-check@file"
+      # --- MIDDLEWARE 2: Production web services (${DOMAIN_1}) ---
+      # Redirect unauthorized requests to auth.${DOMAIN_1}
+      - "traefik.http.middlewares.authelia-${MW_NAME_1}.forwardauth.address=http://authelia:9091/api/verify?rd=https://auth.${DOMAIN_1}/"
+      - "traefik.http.middlewares.authelia-${MW_NAME_1}.forwardauth.trustForwardHeader=true"
+      - "traefik.http.middlewares.authelia-${MW_NAME_1}.forwardauth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
+      - "traefik.http.middlewares.authelia-${MW_NAME_1}.forwardauth.maxResponseBodySize=10240"
+      - "traefik.http.routers.authelia-${MW_NAME_1}.middlewares=crowdsec-check@file"
+      # --- MIDDLEWARE 3: Secondary services (${DOMAIN_NK1}) ---
+      # Redirect unauthorized requests to auth.${DOMAIN_NK1}
+      - "traefik.http.middlewares.authelia-${MW_NAME_NK1a}_org.forwardauth.address=http://authelia:9091/api/verify?rd=https://auth.${DOMAIN_NK1}/"
+      - "traefik.http.middlewares.authelia-${MW_NAME_NK1a}_org.forwardauth.trustForwardHeader=true"
+      - "traefik.http.middlewares.authelia-${MW_NAME_NK1a}_org.forwardauth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
+      - "traefik.http.middlewares.authelia-${MW_NAME_NK1a}_org.forwardauth.maxResponseBodySize=10240"
+      - "traefik.http.routers.authelia-${MW_NAME_NK1a}_org.middlewares=crowdsec-check@file"
+
+  # ==========================================
+  # 3. SHARED INFRASTRUCTURE (DB & In-Memory Cache)
+  # ==========================================
+  db:
+    image: mariadb:12.3
+    container_name: mariadb_shared
+    command: >
+      --transaction-isolation=READ-COMMITTED
+      --log-bin=binlog
+      --binlog-format=ROW
+      --innodb-buffer-pool-size=2G
+      --log-bin-trust-function-creators=1
+      --innodb-use-native-aio=0
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --character-set-client-handshake=FALSE
+      --max-allowed-packet=128M
+      --wait_timeout=28800
+      --innodb-log-file-size=256M
+      --slow_query_log=1
+      --long_query_time=2
+      --tmp_table_size=64M
+      --max_heap_table_size=64M
+    volumes:
+      - ./appdata/mariadb:/var/lib/mysql
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=${TZ}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}10
+    restart: always
+
+  redis:
+    image: redis:alpine
+    container_name: redis_shared
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=${TZ}
+
+    # --- Redis In-Memory Cache Tuning ---
+    # --maxmemory 512mb: Cap RAM at 512MB (sufficient for 3 WordPress sites + Nextcloud)
+    # --maxmemory-policy allkeys-lru: Evict least recently used keys when memory limit is reached
+    # --save "": Disable disk snapshots (RDB) to eliminate unnecessary NVMe I/O wear
+    # --appendonly no: Disable Append-Only File persistence
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}11
+    restart: always
+
+  # ==========================================
+  # 4. NEXTCLOUD (Pure Docker: FPM + Nginx)
+  # ==========================================
+  nextcloud_app:
+    image: custom-nextcloud:fpm-full
+    build: ./docker_build/nextcloud
+    #profiles: ["disable"] # Uncomment to disable service
+    container_name: nextcloud_app
+    extra_hosts:
+      - "cloud.${DOMAIN_2}:${NET_WEB_NET}2"
+      - "${DOMAIN_2}:${NET_WEB_NET}2"
+      - "cloud.${DOMAIN_NK1}:${NET_WEB_NET}2"
+      - "office.${DOMAIN_2}:${NET_WEB_NET}2"
+      - "talk.${DOMAIN_2}:${NET_WEB_NET}2"
+    volumes:
+      # 1. User data stored on SATA HDD
+      - ${BACKUP_02}/nc_data:/var/www/html/data
+      # 2. Core configuration stored on NVMe SSD
+      - ./appdata/web/nextcloud/config:/var/www/html/config
+      # 3. Persistent custom apps on NVMe SSD
+      - ./appdata/web/nextcloud/custom_apps:/var/www/html/custom_apps
+      # 4. Persistent custom themes on NVMe SSD
+      - ./appdata/web/nextcloud/themes:/var/www/html/themes
+      # 5. Timezone synchronization
+      - /etc/localtime:/etc/localtime:ro
+      # Nextcloud external storage mounts (read-only)
+      - ${BACKUP_01}/archives/media/photos:/mnt/ext_backup_01/archives/media/photos:ro
+      - ${DISK_01}/musica:/mnt/ext_nc-music-edit/musica:ro
+      # PHP runtime configurations
+      - ./appdata/php/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
+      - ./appdata/php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      # Custom PHP-FPM pool configuration override
+      - ./appdata/php/www.conf:/usr/local/etc/php-fpm.d/zz-custom.conf:ro
+      # Mount host fonts read-only for document rendering
+      - /usr/share/fonts:/usr/share/fonts:ro
+    environment:
+      - TZ=${TZ}
+      - NC_serverid=1
+      - MYSQL_HOST=db
+      - REDIS_HOST=redis
+      # Trusted domains (space-separated)
+      - NEXTCLOUD_TRUSTED_DOMAINS=${DOMAIN_2} cloud.${DOMAIN_2} cloud.${DOMAIN_NK1}
+      # Intel integrated GPU driver for hardware acceleration
+      - LIBVA_DRIVER_NAME=iHD
+      # --- PHP-FPM process pool tuning (reference values for 8GB host RAM) ---
+      #- PM_MAX_CHILDREN=25        # Max 25 concurrent requests
+      #- PM_START_SERVERS=5        # Start with 5 spare child processes
+      #- PM_MIN_SPARE_SERVERS=5    # Minimum spare child processes
+      #- PM_MAX_SPARE_SERVERS=10   # Max idle processes to conserve RAM
+      #- PM_MAX_REQUESTS=1000      # Respawn worker after 1000 requests to prevent leaks
+      # ------------------------------
+    labels:
+      # Exclude custom-built local image from Diun update polling
+      - "diun.enable=false"
+    devices:
+      # Intel iGPU device passthrough
+      - /dev/dri:/dev/dri
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - MKNOD
+    security_opt:
+      - apparmor:unconfined
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}20
+    restart: always
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+      coturn:
+        condition: service_started
+
+
+  nextcloud_nginx:
+    image: nginx:latest
+    #profiles: ["disable"] # Uncomment to disable service
+    container_name: nextcloud_nginx
+    extra_hosts:
+      - "cloud.${DOMAIN_2}:${NET_WEB_NET}2"
+      - "${DOMAIN_2}:${NET_WEB_NET}2"
+      - "cloud.${DOMAIN_NK1}:${NET_WEB_NET}2"
+      - "office.${DOMAIN_2}:${NET_WEB_NET}2"
+    environment:
+      - TZ=${TZ}
+    volumes_from:
+      - nextcloud_app # Inherit app volumes for static assets
+    volumes:
+      # Dedicated Nextcloud Nginx configuration
+      - ./web/nginx_conf/nextcloud.conf:/etc/nginx/conf.d/default.conf:ro
+      # Enforce read-only mounts on Nginx frontend for defense-in-depth
+      # Override inherited volumes to read-only (:ro)
+      - ${BACKUP_02}/nc_data:/var/www/html/data:ro
+      - ./appdata/web/nextcloud/config:/var/www/html/config:ro
+      - ./appdata/web/nextcloud/custom_apps:/var/www/html/custom_apps:ro
+      - ./appdata/web/nextcloud/themes:/var/www/html/themes:ro
+      # Timezone synchronization
+      - /etc/localtime:/etc/localtime:ro
+    links:
+      - nextcloud_app
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}21
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nc.rule=Host(`cloud.${DOMAIN_2}`) || Host(`${DOMAIN_2}`) || Host(`cloud.${DOMAIN_NK1}`)"
+      - "traefik.http.routers.nc.entrypoints=websecure"
+      - "traefik.http.routers.nc.tls.certresolver=cloudflare"
+      # Enforce HSTS security headers
+      - "traefik.http.middlewares.nc-header.headers.stsSeconds=15552000"
+      - "traefik.http.middlewares.nc-header.headers.forceSTSHeader=true"
+      - "traefik.http.routers.nc.middlewares=nc-header,crowdsec-check@file"
+    depends_on:
+      nextcloud_app:
+        condition: service_started
+
+  # ==========================================
+  # 4a. COLLABORA ONLINE (Dedicated Document Server)
+  # ==========================================
+  collabora:
+    image: collabora/code:latest
+    container_name: collabora
+    extra_hosts:
+      - "${DOMAIN_2}:${NET_WEB_NET}2"
+      - "cloud.${DOMAIN_2}:${NET_WEB_NET}2"
+      - "cloud.${DOMAIN_NK1}:${NET_WEB_NET}2"
+    environment:
+      - TZ=${TZ}
+      # 1. DOMAIN ALLOWLIST: Nextcloud instances authorized to connect (comma-separated)
+      - aliasgroup1=https://cloud.${DOMAIN_2}:443,https://${DOMAIN_2}:443,https://cloud.${DOMAIN_NK1}:443
+      - server_name=office.${DOMAIN_2}
+      # 2. SSL TERMINATION: Delegate TLS termination to Traefik
+      - extra_params=--o:ssl.enable=false --o:ssl.termination=true
+      # Default dictionaries
+      - Dictionaries=it_IT,en_US
+    cap_add:
+      - MKNOD
+      - SYS_ADMIN
+    # Required capability for Collabora internal chroot mounts
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - /usr/share/fonts:/opt/collaboraoffice/share/fonts/truetype/custom:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}40
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.collabora.rule=Host(`office.${DOMAIN_2}`)"
+      - "traefik.http.routers.collabora.entrypoints=websecure"
+      - "traefik.http.routers.collabora.tls.certresolver=cloudflare"
+      # Note: Authelia ForwardAuth must NOT be enabled here; Nextcloud connects via WOPI tokens.
+      - "traefik.http.routers.collabora.middlewares=crowdsec-check@file"
+      - "traefik.http.services.collabora.loadbalancer.server.port=9980"
+
+  # ==========================================
+  # 4b. NEXTCLOUD WHITEBOARD (WebSocket Server for Excalidraw)
+  # ==========================================
+  whiteboard:
+    image: ghcr.io/nextcloud-releases/whiteboard:stable
+    container_name: whiteboard
+    environment:
+      - TZ=${TZ}
+      # Primary Nextcloud domain
+      - NEXTCLOUD_URL=https://${DOMAIN_2}
+      # Internal JWT shared secret
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY_WHITEBOARD}
+      - MAX_UPLOAD_FILE_SIZE=20971520
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}34
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whiteboard.rule=Host(`whiteboard.${DOMAIN_2}`)"
+      - "traefik.http.routers.whiteboard.entrypoints=websecure"
+      - "traefik.http.routers.whiteboard.tls.certresolver=cloudflare"
+      - "traefik.http.services.whiteboard.loadbalancer.server.port=3002"
+      # CrowdSec bouncer protection
+      # Note: Authelia omitted; authentication handled via internal JWT tokens.
+      - "traefik.http.routers.whiteboard.middlewares=crowdsec-check@file"
+
+  # ==========================================
+  # 4c. COTURN (STUN/TURN Server for Video Calls)
+  # ==========================================
+  coturn:
+    image: coturn/coturn:latest
+    container_name: coturn
+    restart: always
+    network_mode: host  # Required: run in host network mode for direct UDP traversal
+    volumes:
+      # Logs
+      - ./coturn/logs:/var/log
+      # Timezone
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - DETECT_EXTERNAL_IP=turn.${DOMAIN_2}
+      - DETECT_RELAY_IP=yes
+      # Secret auth key
+      - STATIC_AUTH_SECRET=${STATIC_AUTH_SECRET_COTURN}
+      - TZ=${TZ}
+      - prometheus
+    command:
+      - --log-file=/var/log/turn.log
+      - --verbose
+      #- --syslog
+      #- --log-file-level=INFO
+      - --use-auth-secret
+      #- --no-cli
+      - --external-ip=turn.${DOMAIN_2} # Discovers public IP automatically
+      - --realm=turn.${DOMAIN_2}
+      #- --listening-ip=0.0.0.0
+      - --listening-port=${COTURN_PORT1}
+      - --min-port=${COTURN_PORT2}      # Relay port range start
+      - --max-port=${COTURN_PORT3}      # Relay port range end (restricted to 200 ports for security)
+      - --fingerprint
+      - --static-auth-secret=${STATIC_AUTH_SECRET_COTURN}
+      - --pidfile=/var/tmp/turnserver.pid
+      # Disable plain TLS to keep logs clean (WebRTC handles end-to-end DTLS)
+      - --no-tls
+      #- --no-dtls
+      # Prometheus metrics
+      - --prometheus
+      - --prometheus-port=9641
+      - --prometheus-path=/metrics
+
+  # ==========================================
+  # 4d. AI CHAT INTERFACE (Open WebUI - ChatGPT Style)
+  # ==========================================
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open_webui
+    restart: always
+    environment:
+      - TZ=${TZ}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY_OWEBUI}
+      # Connect to external OpenRouter API endpoint
+      - OPENAI_API_BASE_URL=https://openrouter.ai/api/v1
+      # Leave empty here; API key is configured securely inside the UI settings
+      - OPENAI_API_KEY=
+      # Disable public registrations after initial admin account creation
+      - ENABLE_SIGNUP=false
+      # Disable local Ollama endpoints (cloud inference only)
+      - ENABLE_OLLAMA_API=false
+      - CORS_ALLOW_ORIGIN=https://chat.${DOMAIN_2}
+      #- ENABLE_KB_EXEC=true
+    volumes:
+      - ./appdata/open-webui:/app/backend/data
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}51
+    labels:
+      - "traefik.enable=true"
+      # Subdomain routing
+      - "traefik.http.routers.openwebui.rule=Host(`chat.${DOMAIN_2}`)"
+      - "traefik.http.routers.openwebui.entrypoints=websecure"
+      - "traefik.http.routers.openwebui.tls.certresolver=cloudflare"
+      # Open WebUI internal port
+      - "traefik.http.services.openwebui.loadbalancer.server.port=8080"
+      # Protected by CrowdSec bouncer and Authelia 2FA
+      - "traefik.http.routers.openwebui.middlewares=crowdsec-check@file,authelia-${MW_NAME_2}"
+
+  # ==========================================
+  # 5. SITO WP 1: ${DOMAIN_1} (www -> non-www)
+  # ==========================================
+  ${MW_NAME_1a}_php:
+    # Path to custom Dockerfile
+    build: ./docker_build/wordpress
+    # Tag for local custom image caching
+    image: custom-wordpress:php8.3-redis
+    container_name: ${MW_NAME_1a}_php
+    extra_hosts:
+      - "${DOMAIN_1}:${NET_WEB_NET}2"
+      - "www.${DOMAIN_1}:${NET_WEB_NET}2"
+    volumes:
+      # Persistent site content (plugins, themes, uploads)
+      - ./appdata/web/${DOMAIN_1}/wp-content:/var/www/html/wp-content
+      # Dedicated wp-config.php on SSD
+      - ./appdata/web/${DOMAIN_1}/wp-config.php:/var/www/html/wp-config.php
+      - ./appdata/php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - /etc/localtime:/etc/localtime:ro
+      # PHP OPcache
+      - ./appdata/php/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
+      # --- Site-specific FPM pool override ---
+      # Allocates custom worker pool limit
+      - ./appdata/php/wp-pool.conf:/usr/local/etc/php-fpm.d/zz-custom.conf:ro
+      # ------------------------------------------
+    environment:
+      # Database credentials managed in wp-config.php
+      - TZ=${TZ}
+      - WORDPRESS_DB_HOST=db
+    labels:
+      # Exclude custom-built image from Diun update polling
+      - "diun.enable=false"
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}22
+    restart: always
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+
+  ${MW_NAME_1a}_nginx:
+    image: nginx:latest
+    container_name: ${MW_NAME_1a}_nginx
+    environment:
+      - TZ=${TZ}
+    volumes_from:
+      - ${MW_NAME_1a}_php
+    volumes:
+      # Generic Nginx config for WordPress + W3 Total Cache
+      - ./web/nginx_conf/wordpress-w3tcache.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./appdata/web/${DOMAIN_1}/wp-content:/var/www/html/wp-content:ro
+      - /etc/localtime:/etc/localtime:ro
+    links:
+      - ${MW_NAME_1a}_php:php
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}23
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      # --- 1. Internal Traefik service definition ---
+      # Internal load balancer routing on port 80
+      - "traefik.http.services.${MW_NAME_1a}-svc.loadbalancer.server.port=80"
+      # Handle both root domain and www subdomain
+      - "traefik.http.routers.${MW_NAME_1a}.rule=Host(`${DOMAIN_1}`) || Host(`www.${DOMAIN_1}`)"
+      - "traefik.http.routers.${MW_NAME_1a}.entrypoints=websecure"
+      - "traefik.http.routers.${MW_NAME_1a}.tls.certresolver=cloudflare"
+      # Middleware: Canonical www -> non-www 301 redirect
+      - "traefik.http.middlewares.${MW_NAME_1a}-redirect.redirectregex.regex=^https?://www.${DOMAIN_1}/(.*)"
+      - "traefik.http.middlewares.${MW_NAME_1a}-redirect.redirectregex.replacement=https://${DOMAIN_1}/$${1}"
+      - "traefik.http.middlewares.${MW_NAME_1a}-redirect.redirectregex.permanent=true"
+      # --- Middleware: Root localization redirect ---
+      # Regex matches exact trailing /en or /en/
+      - "traefik.http.middlewares.${MW_NAME_1a}-en-strip.redirectregex.regex=^https://${DOMAIN_1}/en/*$$"
+      - "traefik.http.middlewares.${MW_NAME_1a}-en-strip.redirectregex.replacement=https://${DOMAIN_1}/"
+      - "traefik.http.middlewares.${MW_NAME_1a}-en-strip.redirectregex.permanent=true"
+      - "traefik.http.routers.${MW_NAME_1a}.middlewares=${MW_NAME_1a}-redirect,${MW_NAME_1a}-en-strip,crowdsec-check@file"
+      # Link router to internal service
+      - "traefik.http.routers.${MW_NAME_1a}.service=${MW_NAME_1a}-svc"
+      # --- 2. Administrative protected router (Authelia 2FA) ---
+      # Matches login and admin paths with higher specificity
+      # Evaluates with precedence over public router
+      # Matches /wp-login.php and /wp-admin while allowing /wp-admin/admin-ajax.php through
+      - "traefik.http.routers.${MW_NAME_1a}-secure.rule=(Host(`${DOMAIN_1}`) || Host(`www.${DOMAIN_1}`)) && (Path(`/wp-login.php`) || (PathPrefix(`/wp-admin`) && !PathPrefix(`/wp-admin/admin-ajax.php`)))"
+      - "traefik.http.routers.${MW_NAME_1a}-secure.entrypoints=websecure"
+      - "traefik.http.routers.${MW_NAME_1a}-secure.tls.certresolver=cloudflare"
+      # Enforces Authelia 2FA on administrative access
+      - "traefik.http.routers.${MW_NAME_1a}-secure.middlewares=${MW_NAME_1a}-redirect,crowdsec-check@file,authelia-${MW_NAME_1}"
+      # Connect protected router to same internal service
+      - "traefik.http.routers.${MW_NAME_1a}-secure.service=${MW_NAME_1a}-svc"
+    depends_on:
+      ${MW_NAME_1a}_php:
+        condition: service_started
+
+  # ==========================================
+  # 5a. SITO IT / SYSADMIN STATICO: ${DOMAIN_3}
+  # ==========================================
+  domain3_it_web:
+    image: nginx:alpine
+    container_name: domain3_it_web
+    restart: always
+    volumes:
+      - ./appdata/web/${DOMAIN_3}:/usr/share/nginx/html:ro
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}36
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${MW_NAME_3}.rule=Host(`${DOMAIN_3}`) || Host(`www.${DOMAIN_3}`)"
+      - "traefik.http.routers.${MW_NAME_3}.entrypoints=websecure"
+      - "traefik.http.routers.${MW_NAME_3}.tls.certresolver=cloudflare"
+      - "traefik.http.middlewares.${MW_NAME_3}-redirect.redirectregex.regex=^https?://www.${DOMAIN_3}/(.*)"
+      - "traefik.http.middlewares.${MW_NAME_3}-redirect.redirectregex.replacement=https://${DOMAIN_3}/$${1}"
+      - "traefik.http.middlewares.${MW_NAME_3}-redirect.redirectregex.permanent=true"
+      - "traefik.http.routers.${MW_NAME_3}.middlewares=${MW_NAME_3}-redirect,crowdsec-check@file"
+      - "traefik.http.services.${MW_NAME_3}.loadbalancer.server.port=80"
+
+  # ==========================================
+  # 6. SITO WP 2: ${DOMAIN_NK1} (non-www -> www)
+  # ==========================================
+  ${MW_NAME_NK1a}_main_php:
+    image: wordpress:7-php8.3-fpm
+#    profiles: ["disable"] # Uncomment to disable service
+    container_name: ${MW_NAME_NK1a}_main_php
+    extra_hosts:
+      - "${DOMAIN_NK1}:${NET_WEB_NET}2"
+      - "www.${DOMAIN_NK1}:${NET_WEB_NET}2"
+    volumes:
+      - ./appdata/web/${DOMAIN_NK1}/wp-content:/var/www/html/wp-content
+      - ./appdata/web/${DOMAIN_NK1}/wp-config.php:/var/www/html/wp-config.php
+      - ./appdata/php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - /etc/localtime:/etc/localtime:ro
+      # PHP OPcache
+      - ./appdata/php/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
+    environment:
+      - TZ=${TZ}
+      - WORDPRESS_DB_HOST=db
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}35
+    restart: always
+    depends_on:
+      db:
+        condition: service_started
+
+  ${MW_NAME_NK1a}_main_nginx:
+    image: nginx:latest
+#    profiles: ["disable"] # Uncomment to disable service
+    container_name: ${MW_NAME_NK1a}_main_nginx
+    volumes_from:
+      - ${MW_NAME_NK1a}_main_php
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ./web/nginx_conf/wordpress.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./appdata/web/${DOMAIN_NK1}/wp-content:/var/www/html/wp-content:ro
+      - /etc/localtime:/etc/localtime:ro
+    links:
+      - ${MW_NAME_NK1a}_main_php:php
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}25
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      # Define internal service on port 80
+      - "traefik.http.services.${MW_NAME_NK1a}-svc.loadbalancer.server.port=80"
+      # ---------------------
+      - "traefik.http.routers.${MW_NAME_NK1a}.rule=Host(`${DOMAIN_NK1}`) || Host(`www.${DOMAIN_NK1}`)"
+      - "traefik.http.routers.${MW_NAME_NK1a}.entrypoints=websecure"
+      - "traefik.http.routers.${MW_NAME_NK1a}.tls.certresolver=cloudflare"
+      # Middleware: Canonical non-www -> www 301 redirect
+      - "traefik.http.middlewares.${MW_NAME_NK1a}-redirect.redirectregex.regex=^https?://${DOMAIN_NK1}/(.*)"
+      - "traefik.http.middlewares.${MW_NAME_NK1a}-redirect.redirectregex.replacement=https://www.${DOMAIN_NK1}/$${1}"
+      - "traefik.http.middlewares.${MW_NAME_NK1a}-redirect.redirectregex.permanent=true"
+      - "traefik.http.routers.${MW_NAME_NK1a}.middlewares=${MW_NAME_NK1a}-redirect,crowdsec-check@file"
+      - "traefik.http.routers.${MW_NAME_NK1a}.service=${MW_NAME_NK1a}-svc"
+      # --- 2. Administrative protected router (Authelia 2FA) ---
+      # Matches login and admin paths with higher specificity
+      # Evaluates with precedence over public router
+      # Matches /wp-login.php and /wp-admin while allowing /wp-admin/admin-ajax.php through
+      - "traefik.http.routers.${MW_NAME_NK1a}-secure.rule=(Host(`${DOMAIN_NK1}`) || Host(`www.${DOMAIN_NK1}`)) && (Path(`/wp-login.php`) || (PathPrefix(`/wp-admin`) && !PathPrefix(`/wp-admin/admin-ajax.php`)))"
+      - "traefik.http.routers.${MW_NAME_NK1a}-secure.entrypoints=websecure"
+      - "traefik.http.routers.${MW_NAME_NK1a}-secure.tls.certresolver=cloudflare"
+      # Enforces Authelia 2FA on admin paths
+      - "traefik.http.routers.${MW_NAME_NK1a}-secure.middlewares=${MW_NAME_NK1a}-redirect,crowdsec-check@file,authelia-${MW_NAME_NK1a}_org"
+      # Link router to internal service
+      - "traefik.http.routers.${MW_NAME_NK1a}-secure.service=${MW_NAME_NK1a}-svc"
+    depends_on:
+      ${MW_NAME_NK1a}_main_php:
+        condition: service_started
+
+  # ==========================================
+  # 7. SITO WP 3: ${MW_SUBNAME_NK1a} (www -> non-www)
+  # ==========================================
+  ${MW_SUBNAME_NK1a}_php:
+    image: wordpress:7-php8.3-fpm
+#    profiles: ["disable"] # Uncomment to disable service
+    container_name: ${MW_SUBNAME_NK1a}_php
+    extra_hosts:
+      - "${MW_SUBNAME_NK1a}.${DOMAIN_NK1}:${NET_WEB_NET}2"
+      - "www.${MW_SUBNAME_NK1a}.${DOMAIN_NK1}:${NET_WEB_NET}2"
+    volumes:
+      - ./appdata/web/${MW_SUBNAME_NK1a}.${DOMAIN_NK1}/wp-content:/var/www/html/wp-content
+      - ./appdata/web/${MW_SUBNAME_NK1a}.${DOMAIN_NK1}/wp-config.php:/var/www/html/wp-config.php
+      - ./appdata/php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - /etc/localtime:/etc/localtime:ro
+      # PHP OPcache
+      - ./appdata/php/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
+    environment:
+      - TZ=${TZ}
+      - WORDPRESS_DB_HOST=db
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}26
+    restart: always
+    depends_on:
+      db:
+        condition: service_started
+
+  ${MW_SUBNAME_NK1a}_nginx:
+    image: nginx:latest
+#    profiles: ["disable"] # Uncomment to disable service
+    container_name: ${MW_SUBNAME_NK1a}_nginx
+    environment:
+      - TZ=${TZ}
+    volumes_from:
+      - ${MW_SUBNAME_NK1a}_php
+    volumes:
+      - ./web/nginx_conf/wordpress.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./appdata/web/${MW_SUBNAME_NK1a}.${DOMAIN_NK1}/wp-content:/var/www/html/wp-content:ro
+      - /etc/localtime:/etc/localtime:ro
+    links:
+      - ${MW_SUBNAME_NK1a}_php:php
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}27
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      # Define internal service on port 80
+      - "traefik.http.services.${MW_SUBNAME_NK1a}-svc.loadbalancer.server.port=80"
+      # ---------------------------
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}.rule=Host(`${MW_SUBNAME_NK1a}.${DOMAIN_NK1}`) || Host(`www.${MW_SUBNAME_NK1a}.${DOMAIN_NK1}`)"
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}.entrypoints=websecure"
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}.tls.certresolver=cloudflare"
+      # Middleware: Canonical www -> non-www 301 redirect
+      #- "traefik.http.routers.${MW_SUBNAME_NK1a}.middlewares=${MW_SUBNAME_NK1a}-redirect"
+      - "traefik.http.middlewares.${MW_SUBNAME_NK1a}-redirect.redirectregex.regex=^https?://www.${MW_SUBNAME_NK1a}.${DOMAIN_NK1}/(.*)"
+      - "traefik.http.middlewares.${MW_SUBNAME_NK1a}-redirect.redirectregex.replacement=https://${MW_SUBNAME_NK1a}.${DOMAIN_NK1}/$${1}"
+      - "traefik.http.middlewares.${MW_SUBNAME_NK1a}-redirect.redirectregex.permanent=true"
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}.middlewares=${MW_SUBNAME_NK1a}-redirect,crowdsec-check@file"
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}.service=${MW_SUBNAME_NK1a}-svc"
+      # --- 2. Administrative protected router (Authelia 2FA) ---
+      # Matches login and admin paths with higher specificity
+      # Evaluates with precedence over public router
+      # Matches /wp-login.php and /wp-admin while allowing /wp-admin/admin-ajax.php through
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}-secure.rule=(Host(`${MW_SUBNAME_NK1a}.${DOMAIN_NK1}`) || Host(`www.${MW_SUBNAME_NK1a}.${DOMAIN_NK1}`)) && (Path(`/wp-login.php`) || (PathPrefix(`/wp-admin`) && !PathPrefix(`/wp-admin/admin-ajax.php`)))"
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}-secure.entrypoints=websecure"
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}-secure.tls.certresolver=cloudflare"
+      # Enforces Authelia 2FA on admin paths
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}-secure.middlewares=${MW_SUBNAME_NK1a}-redirect,crowdsec-check@file,authelia-${MW_NAME_NK1a}_org"
+      # Link router to internal service
+      - "traefik.http.routers.${MW_SUBNAME_NK1a}-secure.service=${MW_SUBNAME_NK1a}-svc"
+    depends_on:
+      ${MW_SUBNAME_NK1a}_php:
+        condition: service_started
+
+  # ==========================================
+  # 8. BACKUP SYSTEM (Backrest / Restic Backup Orchestrator)
+  # ==========================================
+  backrest:
+    # image: garethgeorge/backrest:latest
+    build: ./docker_build/backrest       # Custom build adding MariaDB client tools for pre-backup dumps
+    image: custom-backrest:with-tools
+    container_name: backrest
+    restart: always
+    environment:
+      - TZ=${TZ}
+      - BACKREST_DATA=/app/data
+      - BACKREST_CONFIG=/app/config/config.json
+      - XDG_CACHE_HOME=/app/cache
+      - GOGC=50
+    volumes:
+      # Backup sources (mounted read-only for safety)
+      - ${BACKUP_02}:${BACKUP_02}:ro
+      - ${HOMELAB_DIR}:/source/homelab:ro
+      - /etc:/source/etc:ro
+      # Mount dump target read-write for SQL pre-backup scripts
+      - ${HOMELAB_DIR}/db_dumps:/db_dumps:rw
+      # Backup repository destination
+      - ${BACKUP_01}:/repo
+
+      # Backrest persistent configurations and cache
+      - ./appdata/backrest/data:/app/data
+      - ./appdata/backrest/config:/app/config
+      - ./appdata/backrest/cache:/app/cache
+
+      # --- Custom automation hooks ---
+      # 1. Pre/post backup hook scripts
+      - ./appdata/backrest/scripts:/scripts
+      # 2. Docker socket (allows Backrest hooks to interact with containers)
+      - /var/run/docker.sock:/var/run/docker.sock
+      # -----------------------------
+      - /etc/localtime:/etc/localtime:ro
+    labels:
+      - "diun.enable=false" # Exclude custom build from Diun update polling
+    ports:
+      - "9898:9898"
+    depends_on:
+      db:
+        condition: service_started
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}12
+
+  # ==========================================
+  # 8a. CONTAINER MANAGEMENT (Portainer)
+  # ==========================================
+  portainer:
+    image: portainer/portainer-ce:latest
+    #profiles: ["disable"] # Uncomment to disable service
+    container_name: portainer
+    extra_hosts:
+      - "docker.${DOMAIN_2}:${NET_WEB_NET}2"
+    environment:
+      - TZ=${TZ}
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro # Docker socket management
+      - ./appdata/portainer:/data                    # Persistent data directory
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}28
+    labels:
+      - "traefik.enable=true"
+      # Domain routing
+      - "traefik.http.routers.portainer.rule=Host(`docker.${DOMAIN_2}`)"
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls.certresolver=cloudflare"
+      # Authentication middleware
+      # Remove the lines below to use Portainer's internal native login instead:
+      # - "traefik.http.routers.portainer.middlewares=auth"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+      - "traefik.http.routers.portainer.middlewares=crowdsec-check@file,authelia-${MW_NAME_2}"
+      # - "traefik.http.middlewares.lan-only.ipallowlist.sourcerange=127.0.0.1/32,${NET_LOCAL}0/24,${NET_WEB_NET}0/16"
+      # - "traefik.http.routers.portainer.middlewares=lan-only@docker"
+
+  # ==========================================
+  # 8b. MONITORING STACK
+  # ==========================================
+
+  # Metrics Storage (VictoriaMetrics)
+  prometheus: # Kept container name 'prometheus' for seamless Grafana datasource compatibility
+    image: victoriametrics/victoria-metrics:latest
+    #profiles: ["disable"] # Uncomment to enable
+    container_name: prometheus
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ./appdata/prometheus/data:/victoria-metrics-data
+      - ./appdata/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /etc/localtime:/etc/localtime:ro
+    command:
+      - "--promscrape.config=/etc/prometheus/prometheus.yml"
+      - "--retentionPeriod=1y" # VictoriaMetrics high-compression storage allows 1-year retention with minimal disk impact
+      - "--enableTCP6"
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}29
+    restart: always
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    environment:
+      - TZ=${TZ}
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}32
+    restart: always
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+      - /etc/localtime:/etc/localtime:ro
+    devices:
+      - /dev/kmsg
+    command:
+      # Monitor Docker containers only (ignore host system processes)
+      - '--docker_only=true'
+      # Throttle internal metrics sampling to 15s interval
+      # Matches Prometheus scraping frequency to conserve CPU resources
+      - '--housekeeping_interval=15s'
+      # Disable heavy metric collectors that cause high CPU/RAM overhead
+      # disk: Per-container disk usage calculation is resource-intensive
+      # diskIO: Skip per-container I/O statistics
+      # tcp/udp/advtcp: Exclude advanced networking telemetry
+      # percpu: Total CPU metrics are sufficient; skip per-core telemetry
+      # sched/process: Kernel scheduling stats omitted
+      - '--disable_metrics=disk,diskIO,tcp,udp,percpu,sched,process,advtcp,referenced_memory'
+      # Skip metric collection for stopped containers
+      - '--store_container_labels=false'
+    privileged: true # Privileged mode required for cgroup v2 metrics access on modern Linux kernels
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}33
+    restart: always
+
+  # Metrics Visualization (Grafana)
+  grafana:
+    image: grafana/grafana:latest
+    #profiles: ["disable"] # Uncomment to enable
+    container_name: grafana
+    environment:
+      - TZ=${TZ}
+    extra_hosts:
+      - "monitor.${DOMAIN_2}:${NET_WEB_NET}2"
+    volumes:
+      - ./appdata/grafana:/var/lib/grafana # Persistent dashboards and user data
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}30
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`monitor.${DOMAIN_2}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=cloudflare"
+      # Security: CrowdSec bouncer and Authelia 2FA
+      - "traefik.http.routers.grafana.middlewares=crowdsec-check@file,authelia-${MW_NAME_2}"
+      # Toggle below for LAN-only restriction if needed
+      #- "traefik.http.middlewares.lan-only.ipallowlist.sourcerange=127.0.0.1/32,${NET_LOCAL}0/24,${NET_WEB_NET}0/16"
+      #- "traefik.http.routers.grafana.middlewares=lan-only@docker"
+      # Explicit internal port definition
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
+  # ==========================================
+  # 8c. RSYNC (Isolated / DMZ Target) - Panubo (Quay.io)
+  # ==========================================
+  dmz_rsync:
+    # Upstream SSH/rsync server image
+    image: quay.io/panubo/sshd:latest
+    container_name: dmz_rsync
+    environment:
+      - TZ=${TZ}
+      - SSH_USERS=${DMZ_USR}:${DMZ_UID}:${DMZ_GID}
+      # Hardened: SSH keys only, root login disabled
+      - SSH_ENABLE_PASSWORD_AUTH=false
+      - SSH_ENABLE_ROOT=false
+      - SFTP_MODE=false
+    volumes:
+      # 1. Host SSH keys (preserves host fingerprint across container recreations)
+      - ./appdata/${DMZ_USR}_ssh_config/keys:/etc/ssh/keys
+      # Mount hardened sshd_config
+      - ./appdata/${DMZ_USR}_ssh_config/config/sshd_config:/etc/ssh/sshd_config
+      # 2. Authorized public keys
+      # Dedicated key file mapped per user
+      - ./appdata/${DMZ_USR}_ssh_config/id_ed25519.pub:/etc/authorized_keys/${DMZ_USR}
+      # 3. Chrooted backup jail on HDD
+      # Home on backup_01 HDD
+      - ${BACKUP_01}/${DMZ_USR}-container:/home/${DMZ_USR}
+      # 4. Timezone synchronization
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "${DMZ_PPORT}:22"
+    restart: always
+    networks:
+      dmz_net:
+        ipv4_address: ${NET_DMZ_NET}2
+
+  # ==========================================
+  # 8d. ERP & CRM (Dolibarr)
+  # ==========================================
+  dolibarr:
+    image: dolibarr/dolibarr:latest
+    #profiles: ["disable"] # Uncomment to disable service
+    container_name: dolibarr
+    extra_hosts:
+      - "erp.${DOMAIN_2}:${NET_WEB_NET}2"
+    environment:
+      - TZ=${TZ}
+      # Database configuration
+      - DOLI_DB_HOST=db
+      - DOLI_DB_NAME=dolibarr
+      - DOLI_DB_USER=${DOLI_DB_USER}
+      - DOLI_DB_PASSWORD=${DOLI_DB_PASSWORD}
+      # Initial setup
+      #- DOLI_ADMIN_LOGIN=admin
+      #- DOLI_ADMIN_PASSWORD=first_password  # Change default admin password immediately upon first login
+      - DOLI_URL_ROOT=https://erp.${DOMAIN_2}
+      # PHP runtime limits for invoice/document handling
+      - PHP_INI_MEMORY_LIMIT=512M
+      - PHP_INI_UPLOAD_MAX_FILESIZE=100M
+      - PHP_INI_POST_MAX_SIZE=100M
+    volumes:
+      # Generated invoices and documents stored on SATA HDD
+      - ${BACKUP_02}/dolibarr/documents:/var/www/documents
+      # Custom plugins stored on NVMe SSD
+      - ./appdata/dolibarr/custom:/var/www/html/custom
+      # Timezone synchronization
+      - /etc/localtime:/etc/localtime:ro
+      - ./appdata/dolibarr/conf:/var/www/html/conf
+    networks:
+      web_net:
+        ipv4_address: ${NET_WEB_NET}31
+    restart: always
+    depends_on:
+      db:
+        condition: service_started
+    labels:
+      - "traefik.enable=true"
+      # Domain routing rule
+      - "traefik.http.routers.dolibarr.rule=Host(`erp.${DOMAIN_2}`)"
+      - "traefik.http.routers.dolibarr.entrypoints=websecure"
+      - "traefik.http.routers.dolibarr.tls.certresolver=cloudflare"
+      # Protected by CrowdSec bouncer and Authelia 2FA
+      - "traefik.http.routers.dolibarr.middlewares=crowdsec-check@file,authelia-${MW_NAME_2}"
+      # - "traefik.http.middlewares.lan-only.ipallowlist.sourcerange=127.0.0.1/32,${NET_LOCAL}0/24,${NET_WEB_NET}0/16"
+      # - "traefik.http.routers.dolibarr.middlewares=lan-only@docker"
+      # Internal port (Dolibarr listens on port 80)
+      - "traefik.http.services.dolibarr.loadbalancer.server.port=80"
+
+  # ==========================================
+  # 8e. DIUN (Docker Image Update Notifier)
+  # ==========================================
+
+  diun:
+    image: crazymax/diun:latest
+    container_name: diun
+    command: serve
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/localtime:/etc/localtime:ro"
+      - "./appdata/diun:/data"
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+      - LOG_JSON=false
+      #- LOG_LEVEL=debug
+
+      # Outbound notification SMTP settings
+      - DIUN_NOTIF_MAIL_HOST=${DIUN_NOTIF_MAIL_HOST}
+      - DIUN_NOTIF_MAIL_PORT=${DIUN_NOTIF_MAIL_PORT}
+      - DIUN_NOTIF_MAIL_SSL=false
+      - DIUN_NOTIF_MAIL_USERNAME=${EMAIL}
+      - DIUN_NOTIF_MAIL_PASSWORD=${DIUN_NOTIF_MAIL_PASSWORD}
+      # -----------------------
+      - DIUN_NOTIF_MAIL_FROM=${EMAIL}
+      - DIUN_NOTIF_MAIL_TO=${EMAIL}
+      - DIUN_WATCH_SCHEDULE=0 0 * * *
+
+      # Docker image watch settings
+      - DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true
+    networks:
+      trash_net:
+        ipv4_address: ${NET_TRASH_NET}2
+    restart: always
+
+  # ==========================================
+  # 8f. AI SDR SYSTEM (n8n & AI Agents)
+  # ==========================================
+  n8n_sdr:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n_sdr
+    restart: always
+    environment:
+      # Container timezone synced with host for consistent logging
+      - TZ=${TZ}
+      # Internal application schedule aligned with European business hours
+      - GENERIC_TIMEZONE=Europe/Rome
+
+      # Node.js heap limit increased to 1GB to prevent OOM errors on heavy workflows
+      - NODE_OPTIONS=--max-old-space-size=1024
+
+      # ==========================================
+      # NETWORK IDENTITY (v2.x syntax)
+      # ==========================================
+      - N8N_HOST=sdr.${DOMAIN_1}
+      - N8N_PROTOCOL=https
+      - N8N_EDITOR_BASE_URL=https://sdr.${DOMAIN_1}
+
+      # Automated pruning to keep the internal SQLite database lean
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=168
+
+      # Trust 2 reverse proxy hops (Cloudflare edge + local Traefik)
+      - N8N_PROXY_HOPS=2
+      # --- RESOURCE TUNING & COMMUNITY NODE SUPPORT ---
+      # Enable community node package installations
+      - N8N_UNVERIFIED_PACKAGES_ENABLED=true
+      # Lower task timeout to free memory earlier if an upstream API hangs
+      #- N8N_RUNNERS_TASK_TIMEOUT=60
+      # Max ZIP decompression size: 256MB (mitigates memory exhaustion from zip-bombs)
+      - N8N_COMPRESSION_NODE_MAX_DECOMPRESSED_SIZE_BYTES=268435456
+      # Max files per archive: 1000 files
+      - N8N_COMPRESSION_NODE_MAX_ZIP_ENTRIES=1000
+
+    # Isolated container network routing through Traefik reverse proxy
+    networks:
+      sdr_net:
+        ipv4_address: ${NET_SDR_NET}10
+      web_net:
+        ipv4_address: ${NET_WEB_NET}80
+    volumes:
+      # Persistent workflow data included in automated Restic/Backrest snapshots
+      - ./appdata/n8n_sdr:/home/node/.n8n
+      - /etc/localtime:/etc/localtime:ro
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+
+      # Unified routing for web UI and incoming webhooks
+      - "traefik.http.routers.n8n.rule=Host(`sdr.${DOMAIN_1}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=cloudflare"
+
+      # Protected by CrowdSec bouncer against brute-force and bot traffic
+      - "traefik.http.routers.n8n.middlewares=crowdsec-check@file"
+
+##### --------------------------------------------------------------------- ######
+
+networks:
+  web_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NET_WEB_NET}0/16
+          gateway: ${NET_WEB_NET}1
+  sdr_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NET_SDR_NET}0/16
+          gateway: ${NET_SDR_NET}1
+
+  # --- Isolated DMZ network for external backup targets ---
+  dmz_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NET_DMZ_NET}0/16
+          gateway: ${NET_DMZ_NET}1
+
+  trash_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NET_TRASH_NET}0/16
+          gateway: ${NET_TRASH_NET}1
